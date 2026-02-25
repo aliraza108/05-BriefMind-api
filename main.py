@@ -26,7 +26,7 @@ from document_store import DocumentStore
 # ──────────────────────────────────────────────
 # Configuration — Gemini via OpenAI-compatible API
 # ──────────────────────────────────────────────
-API_KEY  = "AIzaSyAbIfJs--F8zeqtkIFHYmkxiEIBsDT0Dkk"
+API_KEY = os.getenv("API_KEY")
 BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
 MODEL    = "gemini-2.5-flash"
 
