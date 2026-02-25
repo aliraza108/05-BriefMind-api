@@ -7,9 +7,8 @@ import os
 import json
 import uuid
 from typing import Optional
-from fastapi import FastAPI, UploadFile, File, HTTPException, Form
+from fastapi import FastAPI, UploadFile, File, HTTPException, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from agents import Agent, Runner, set_default_openai_api, set_default_openai_client, set_tracing_disabled, AsyncOpenAI
@@ -26,20 +25,40 @@ from document_store import DocumentStore
 # ──────────────────────────────────────────────
 # Configuration — Gemini via OpenAI-compatible API
 # ──────────────────────────────────────────────
-import os
+GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
+DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+_ai_configured = False
+MODEL = os.getenv("MODEL", DEFAULT_GEMINI_MODEL)
 
-API_KEY = os.getenv("API_KEY")
 
-if not API_KEY:
-    raise ValueError("API_KEY is not set in environment variables")
-BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
-MODEL    = "gemini-2.5-flash"
+def _get_provider_and_key() -> tuple[Optional[str], Optional[str]]:
+    gemini_key = os.getenv("API_KEY") or os.getenv("GEMINI_API_KEY")
+    if gemini_key:
+        return "gemini", gemini_key
 
-client = AsyncOpenAI(base_url=BASE_URL, api_key=API_KEY)
-set_default_openai_client(client=client)
-set_default_openai_api("chat_completions")
+    return None, None
 
-set_tracing_disabled(True)
+
+def _ensure_ai_ready() -> None:
+    global _ai_configured
+    if _ai_configured:
+        return
+
+    provider, api_key = _get_provider_and_key()
+    if not api_key or not provider:
+        raise HTTPException(
+            status_code=500,
+            detail="Missing Gemini API key. Set API_KEY or GEMINI_API_KEY in environment variables.",
+        )
+
+    global MODEL
+    MODEL = os.getenv("MODEL", DEFAULT_GEMINI_MODEL)
+    client = AsyncOpenAI(base_url=GEMINI_BASE_URL, api_key=api_key)
+
+    set_default_openai_client(client=client)
+    set_default_openai_api("chat_completions")
+    set_tracing_disabled(True)
+    _ai_configured = True
 
 # ──────────────────────────────────────────────
 # In-memory document store (swap for Redis/DB in prod)
@@ -113,6 +132,20 @@ class ChatRequest(BaseModel):
     doc_id: str
     question: str
 
+class ProcessTextRequest(BaseModel):
+    text: str
+    title: str = "Untitled Document"
+
+class ProposalRequest(BaseModel):
+    job_request: Optional[str] = None
+    job: Optional[str] = None
+    job_description: Optional[str] = None
+    description: Optional[str] = None
+    prompt: Optional[str] = None
+    context: Optional[str] = None
+    company: Optional[str] = None
+    sender_name: Optional[str] = None
+
 class BriefingResponse(BaseModel):
     doc_id: str
     executive_summary: str
@@ -174,13 +207,25 @@ async def upload_document(
 
 @app.post("/process", tags=["Processing"])
 async def process_text(
-    text: str = Form(...),
-    title: str = Form("Untitled Document"),
+    request: Request,
 ):
     """
     Paste raw text directly for processing.
     Returns a doc_id and the full executive briefing.
     """
+    content_type = request.headers.get("content-type", "").lower()
+    text = ""
+    title = "Untitled Document"
+
+    if "application/json" in content_type:
+        payload = ProcessTextRequest(**(await request.json()))
+        text = payload.text
+        title = payload.title
+    else:
+        form = await request.form()
+        text = str(form.get("text", "")).strip()
+        title = str(form.get("title", "Untitled Document"))
+
     if len(text.strip()) < 100:
         raise HTTPException(status_code=400, detail="Text too short (min 100 chars).")
 
@@ -219,6 +264,7 @@ Briefing Context:
 
 User Question: {req.question}
 """
+    _ensure_ai_ready()
     result = await Runner.run(chat_agent, prompt)
     return {
         "doc_id": req.doc_id,
@@ -233,6 +279,60 @@ async def list_documents():
     """List all processed documents."""
     docs = store.list_all()
     return {"documents": docs, "count": len(docs)}
+
+
+@app.post("/emails/generate/proposal", tags=["Generation"])
+async def generate_proposal(request: Request):
+    """
+    Generate a professional email proposal from a job request or description.
+    """
+    content_type = request.headers.get("content-type", "").lower()
+    data = {}
+    if "application/json" in content_type:
+        data = await request.json()
+    else:
+        form = await request.form()
+        data = dict(form)
+
+    req = ProposalRequest(**data)
+    source_text = req.job_request or req.job or req.job_description or req.description or req.prompt or req.context
+
+    if not source_text or len(source_text.strip()) < 20:
+        raise HTTPException(
+            status_code=422,
+            detail="Provide a job request/description with at least 20 characters.",
+        )
+
+    _ensure_ai_ready()
+    company = req.company or "the client"
+    sender_name = req.sender_name or "the team"
+    proposal_agent = Agent(
+        name="Proposal Email Generator",
+        model=MODEL,
+        instructions=(
+            "Write clear, concise, professional proposal emails. "
+            "Return plain text only."
+        ),
+    )
+    proposal_prompt = f"""
+Create a professional proposal email.
+
+Client: {company}
+Sender: {sender_name}
+Job Request:
+{source_text.strip()}
+
+Requirements:
+- Include a short subject line on first line as: Subject: ...
+- Keep tone confident and practical
+- Include brief scope, timeline, cost-placeholder, and next step call-to-action
+- Keep total length under 250 words
+"""
+    result = await Runner.run(proposal_agent, proposal_prompt)
+    return {
+        "status": "success",
+        "proposal": result.final_output,
+    }
 
 
 @app.delete("/docs/{doc_id}", tags=["Management"])
@@ -270,7 +370,7 @@ Characters: {char_count:,}
 
 Call all 5 tools in order and return a complete JSON briefing.
 """
-
+    _ensure_ai_ready()
     result = await Runner.run(briefing_agent, prompt)
     raw_output = result.final_output
 
