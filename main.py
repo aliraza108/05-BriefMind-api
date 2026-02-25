@@ -27,6 +27,7 @@ from document_store import DocumentStore
 # ──────────────────────────────────────────────
 GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
 DEFAULT_GEMINI_MODEL = "gemini-2.5-flash"
+DEFAULT_OPENAI_MODEL = "gpt-4o-mini"
 _ai_configured = False
 MODEL = os.getenv("MODEL", DEFAULT_GEMINI_MODEL)
 
@@ -35,6 +36,10 @@ def _get_provider_and_key() -> tuple[Optional[str], Optional[str]]:
     gemini_key = os.getenv("API_KEY") or os.getenv("GEMINI_API_KEY")
     if gemini_key:
         return "gemini", gemini_key
+
+    openai_key = os.getenv("OPENAI_API_KEY")
+    if openai_key:
+        return "openai", openai_key
 
     return None, None
 
@@ -48,16 +53,24 @@ def _ensure_ai_ready() -> None:
     if not api_key or not provider:
         raise HTTPException(
             status_code=500,
-            detail="Missing Gemini API key. Set API_KEY or GEMINI_API_KEY in environment variables.",
+            detail="Missing API key. Set API_KEY/GEMINI_API_KEY (Gemini) or OPENAI_API_KEY (OpenAI).",
         )
 
     global MODEL
-    MODEL = os.getenv("MODEL", DEFAULT_GEMINI_MODEL)
-    client = AsyncOpenAI(base_url=GEMINI_BASE_URL, api_key=api_key)
+    if provider == "gemini":
+        MODEL = os.getenv("MODEL", DEFAULT_GEMINI_MODEL)
+        client = AsyncOpenAI(base_url=GEMINI_BASE_URL, api_key=api_key)
+    else:
+        MODEL = os.getenv("MODEL", DEFAULT_OPENAI_MODEL)
+        client = AsyncOpenAI(api_key=api_key)
 
     set_default_openai_client(client=client)
     set_default_openai_api("chat_completions")
     set_tracing_disabled(True)
+
+    # Agents are instantiated at import time; keep model aligned to selected provider.
+    briefing_agent.model = MODEL
+    chat_agent.model = MODEL
     _ai_configured = True
 
 # ──────────────────────────────────────────────
